@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import {
   Receipt,
   Camera,
@@ -15,6 +15,9 @@ import {
   Calculator,
   UserPlus,
   Pencil,
+  Upload,
+  ImageIcon,
+  AlertCircle,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -75,9 +78,60 @@ const initials = (name: string) =>
     .join("")
     .toUpperCase()
 
+type ParsedItem = { name: string; price: number }
+type ParsedReceipt = { items: ParsedItem[]; tax: number | null }
+
+// Lines whose label matches these are totals/payment rows, not line items.
+const SKIP_KEYWORDS =
+  /\b(sub\s*total|subtotal|total|balance|amount\s*due|change|cash|card|visa|master\s*card|mastercard|debit|credit|payment|tender|paid|due)\b/i
+const TAX_KEYWORDS = /\b(tax|gst|hst|pst|qst|vat)\b/i
+const TIP_KEYWORDS = /\b(tip|gratuity|service\s*charge)\b/i
+
+// Parse raw OCR text from a receipt photo into editable line items + tax.
+function parseReceipt(text: string): ParsedReceipt {
+  const items: ParsedItem[] = []
+  let tax: number | null = null
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) continue
+
+    // A trailing money amount, optionally prefixed with a currency symbol.
+    const priceMatch = line.match(/\$?\s*(\d{1,4}(?:[.,]\d{2}))\s*$/)
+    if (!priceMatch) continue
+
+    const price = Number(priceMatch[1].replace(",", "."))
+    if (!Number.isFinite(price)) continue
+
+    const label = line
+      .slice(0, priceMatch.index)
+      .replace(/[.\s:_-]+$/, "")
+      .trim()
+
+    if (TAX_KEYWORDS.test(label)) {
+      if (tax == null) tax = price
+      continue
+    }
+
+    // Skip totals, tips, and payment rows so they aren't counted as items.
+    if (SKIP_KEYWORDS.test(label) || TIP_KEYWORDS.test(label)) continue
+
+    // Require a real name (at least two letters) and a positive price.
+    if (price <= 0) continue
+    if ((label.match(/[a-zA-Z]/g) || []).length < 2) continue
+
+    items.push({ name: label, price })
+  }
+
+  return { items, tax }
+}
+
 export default function BillSplitterPage() {
   const [step, setStep] = useState<Step>("upload")
   const [scanning, setScanning] = useState(false)
+  const [scanProgress, setScanProgress] = useState(0)
+  const [scanError, setScanError] = useState<string | null>(null)
+  const [receiptImage, setReceiptImage] = useState<string | null>(null)
 
   const [receiptItems, setReceiptItems] = useState<ReceiptItem[]>([])
   const [people, setPeople] = useState<string[]>(["Me"])
@@ -88,17 +142,62 @@ export default function BillSplitterPage() {
   const [tipMode, setTipMode] = useState<TipMode>("percent")
   const [tipValue, setTipValue] = useState<number>(18)
 
-  // --- Step 1: Mock OCR ---
-  const handleScan = () => {
+  // --- Step 1: Scan an uploaded receipt photo with client-side OCR ---
+  const handleFile = async (file: File | undefined | null) => {
+    if (!file) return
+    setScanError(null)
+    const url = URL.createObjectURL(file)
+    setReceiptImage((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return url
+    })
     setScanning(true)
-    setTimeout(() => {
-      setReceiptItems(
-        MOCK_ITEMS.map((m) => ({ ...m, id: uid(), assignedTo: [] })),
-      )
-      setTax(7.25)
-      setScanning(false)
+    setScanProgress(0)
+
+    try {
+      const mod = await import("tesseract.js")
+      const recognize = mod.recognize ?? mod.default?.recognize
+      const { data } = await recognize(file, "eng", {
+        logger: (m: { status: string; progress: number }) => {
+          if (m.status === "recognizing text") {
+            setScanProgress(Math.round(m.progress * 100))
+          }
+        },
+      })
+
+      const { items, tax: parsedTax } = parseReceipt(data.text)
+      if (parsedTax != null) setTax(parsedTax)
+
+      if (items.length === 0) {
+        setScanError(
+          "We couldn't read any items from that photo. Add them manually below, or try a clearer picture.",
+        )
+        setReceiptItems([{ id: uid(), name: "", price: 0, assignedTo: [] }])
+      } else {
+        setReceiptItems(
+          items.map((m) => ({ ...m, id: uid(), assignedTo: [] })),
+        )
+      }
       setStep("assign")
-    }, 2000)
+    } catch (err) {
+      console.error("Receipt OCR failed:", err)
+      setScanError(
+        "Something went wrong while scanning. Please try again with another photo.",
+      )
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  // Optional convenience: load a sample receipt to explore the app.
+  const handleSample = () => {
+    setScanError(null)
+    setReceiptImage(null)
+    setReceiptItems(
+      MOCK_ITEMS.map((m) => ({ ...m, id: uid(), assignedTo: [] })),
+    )
+    setTax(7.25)
+    setStep("assign")
   }
 
   // --- People management ---
@@ -173,6 +272,12 @@ export default function BillSplitterPage() {
     setTax(0)
     setTipMode("percent")
     setTipValue(18)
+    setReceiptImage((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+    setScanError(null)
+    setScanProgress(0)
     setStep("upload")
   }
 
@@ -249,11 +354,18 @@ export default function BillSplitterPage() {
 
         <div className="mt-6 flex-1">
           {step === "upload" && (
-            <UploadView scanning={scanning} onScan={handleScan} />
+            <UploadView
+              scanning={scanning}
+              scanProgress={scanProgress}
+              scanError={scanError}
+              onFile={handleFile}
+              onSample={handleSample}
+            />
           )}
 
           {step === "assign" && (
             <AssignView
+              receiptImage={receiptImage}
               people={people}
               newPerson={newPerson}
               setNewPerson={setNewPerson}
@@ -346,19 +458,46 @@ function Stepper({ step }: { step: Step }) {
 
 function UploadView({
   scanning,
-  onScan,
+  scanProgress,
+  scanError,
+  onFile,
+  onSample,
 }: {
   scanning: boolean
-  onScan: () => void
+  scanProgress: number
+  scanError: string | null
+  onFile: (file: File | undefined | null) => void
+  onSample: () => void
 }) {
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const openPicker = () => {
+    if (!scanning) fileInputRef.current?.click()
+  }
+
   return (
     <Card className="overflow-hidden">
       <CardContent className="p-6">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="sr-only"
+          aria-hidden="true"
+          tabIndex={-1}
+          onChange={(e) => {
+            onFile(e.target.files?.[0])
+            // Reset so re-selecting the same file fires onChange again.
+            e.target.value = ""
+          }}
+        />
+
         <button
           type="button"
-          onClick={scanning ? undefined : onScan}
+          onClick={openPicker}
           disabled={scanning}
-          aria-label="Upload receipt to scan"
+          aria-label="Upload or take a photo of a receipt to scan"
           className="flex w-full flex-col items-center justify-center gap-4 rounded-xl border-2 border-dashed border-border bg-muted/30 px-6 py-14 text-center transition-colors hover:border-primary/50 hover:bg-muted/60 disabled:cursor-not-allowed"
         >
           {scanning ? (
@@ -370,7 +509,8 @@ function UploadView({
               <div>
                 <p className="text-base font-medium">Scanning receipt...</p>
                 <p className="text-sm text-muted-foreground">
-                  Reading items with OCR magic
+                  Reading items with OCR{" "}
+                  {scanProgress > 0 ? `· ${scanProgress}%` : ""}
                 </p>
               </div>
             </>
@@ -382,18 +522,28 @@ function UploadView({
               <div>
                 <p className="text-base font-medium">Tap to upload a receipt</p>
                 <p className="text-sm text-muted-foreground">
-                  Take a photo or choose from your library
+                  Take a photo or choose an image from your library
                 </p>
               </div>
             </>
           )}
         </button>
 
+        {scanError && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive"
+          >
+            <AlertCircle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <span>{scanError}</span>
+          </div>
+        )}
+
         <div className="mt-6 flex flex-col gap-3">
           <Button
             size="lg"
             className="w-full"
-            onClick={onScan}
+            onClick={openPicker}
             disabled={scanning}
           >
             {scanning ? (
@@ -402,13 +552,21 @@ function UploadView({
               </>
             ) : (
               <>
-                <Camera className="size-4" /> Upload Receipt
+                <Upload className="size-4" /> Upload Receipt
               </>
             )}
           </Button>
+          <button
+            type="button"
+            onClick={onSample}
+            disabled={scanning}
+            className="text-center text-xs text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Don&apos;t have one handy? Try a sample receipt
+          </button>
           <p className="text-center text-xs text-muted-foreground">
-            This is a demo — we&apos;ll generate a sample restaurant receipt for
-            you.
+            Photos are scanned right in your browser — nothing is uploaded to a
+            server.
           </p>
         </div>
       </CardContent>
@@ -417,6 +575,7 @@ function UploadView({
 }
 
 type AssignViewProps = {
+  receiptImage: string | null
   people: string[]
   newPerson: string
   setNewPerson: (v: string) => void
@@ -442,6 +601,7 @@ type AssignViewProps = {
 
 function AssignView(props: AssignViewProps) {
   const {
+    receiptImage,
     people,
     newPerson,
     setNewPerson,
@@ -475,6 +635,38 @@ function AssignView(props: AssignViewProps) {
 
   return (
     <div className="flex flex-col gap-5">
+      {/* Scanned bill */}
+      {receiptImage && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ImageIcon className="size-4" aria-hidden="true" /> Your receipt
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Accordion>
+              <AccordionItem value="receipt">
+                <AccordionTrigger className="text-sm text-muted-foreground">
+                  View scanned bill
+                </AccordionTrigger>
+                <AccordionContent>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={receiptImage || "/placeholder.svg"}
+                    alt="Scanned receipt"
+                    className="mx-auto max-h-96 w-auto rounded-lg border object-contain"
+                  />
+                </AccordionContent>
+              </AccordionItem>
+            </Accordion>
+            <p className="mt-2 text-xs text-muted-foreground">
+              We scanned the items below from your photo — double-check the
+              names and prices before splitting.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       {/* People */}
       <Card>
         <CardHeader className="pb-3">
